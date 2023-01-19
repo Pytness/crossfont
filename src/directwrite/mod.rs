@@ -150,10 +150,7 @@ impl DirectWriteRasterizer {
 }
 
 impl crate::Rasterize for DirectWriteRasterizer {
-    fn new(
-        device_pixel_ratio: f32,
-        _ligatures: bool,
-    ) -> Result<DirectWriteRasterizer, Error> {
+    fn new(device_pixel_ratio: f32) -> Result<DirectWriteRasterizer, Error> {
         let analyzer = unsafe {
             let mut factory: *mut dwrite::IDWriteFactory = std::ptr::null_mut();
             let hr = dwrite::DWriteCreateFactory(

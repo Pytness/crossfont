@@ -10,7 +10,7 @@ use freetype::face::LoadFlag;
 use freetype::tt_os2::TrueTypeOS2Table;
 use freetype::{self, Library, Matrix};
 use freetype::{freetype_sys, Face as FtFace};
-use harfbuzz_rs::{Feature};
+use harfbuzz_rs::Feature;
 use libc::{c_long, c_uint};
 use log::{debug, trace};
 
@@ -19,7 +19,8 @@ pub mod fc;
 use fc::{CharSet, FtFaceLocation, Pattern, PatternHash, PatternRef, Rgba};
 
 use super::{
-    BitmapBuffer, Error, FontDesc, FontKey, GlyphKey, Metrics, Rasterize, RasterizedGlyph, Size, Slant, Style, Weight,
+    BitmapBuffer, Error, FontDesc, FontKey, GlyphKey, Metrics, Rasterize, RasterizedGlyph, Size,
+    Slant, Style, Weight,
 };
 
 /// FreeType uses 0 for the missing glyph:
@@ -134,7 +135,7 @@ impl IntoF32 for i64 {
 }
 
 impl Rasterize for FreeTypeRasterizer {
-    fn new(device_pixel_ratio: f32, ligatures: bool) -> Result<FreeTypeRasterizer, Error> {
+    fn new(device_pixel_ratio: f32) -> Result<FreeTypeRasterizer, Error> {
         let library = Library::init()?;
 
         #[cfg(ft_set_default_properties_available)]
@@ -142,7 +143,9 @@ impl Rasterize for FreeTypeRasterizer {
             // Initialize default properties, like user preferred interpreter.
             freetype_sys::FT_Set_Default_Properties(library.raw());
         };
-        let use_font_ligatures = if ligatures { 1 } else { 0 };
+
+        // let use_font_ligatures = if ligatures { 1 } else { 0 };
+        let use_font_ligatures = 1;
         let features = vec![
             Feature::new(b"liga", use_font_ligatures, ..),
             Feature::new(b"calt", use_font_ligatures, ..),
@@ -214,8 +217,7 @@ impl Rasterize for FreeTypeRasterizer {
         self.get_face(desc, size)
     }
 
-
-     fn get_glyph(&mut self, glyph_key: GlyphKey) -> Result<RasterizedGlyph, Error> {
+    fn get_glyph(&mut self, glyph_key: GlyphKey) -> Result<RasterizedGlyph, Error> {
         let font_key = self.face_for_glyph(glyph_key);
         let face = &self.loader.faces[&font_key];
         let index = face.ft_face.get_char_index(glyph_key.character as usize);
@@ -800,8 +802,6 @@ impl FreeTypeRasterizer {
             mode => panic!("unhandled pixel mode: {:?}", mode),
         }
     }
-
-
 }
 
 /// Downscale a bitmap by a fixed factor.
@@ -882,8 +882,6 @@ impl From<freetype::Error> for Error {
 }
 
 unsafe impl Send for FreeTypeRasterizer {}
-
-
 
 impl From<std::io::Error> for Error {
     fn from(val: std::io::Error) -> Error {
