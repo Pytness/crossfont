@@ -1,10 +1,10 @@
 //! Compatibility layer for different font engines.
 //!
-//! CoreText is used on Mac OS.
-//! FreeType is used on everything that's not Mac OS.
-//! Eventually, ClearType support will be available for windows.
+//! CoreText is used on macOS.
+//! DirectWrite is used on Windows.
+//! FreeType is used everywhere else.
 
-#![deny(clippy::all, clippy::if_not_else, clippy::enum_glob_use, clippy::wrong_pub_self_convention)]
+#![deny(clippy::all, clippy::if_not_else, clippy::enum_glob_use)]
 
 use std::fmt::{self, Display, Formatter};
 use std::ops::{Add, Mul};
@@ -24,11 +24,10 @@ pub mod directwrite;
 #[cfg(windows)]
 pub use directwrite::DirectWriteRasterizer as Rasterizer;
 
-// If target is macos, reexport everything from darwin.
 #[cfg(target_os = "macos")]
-mod darwin;
+pub mod darwin;
 #[cfg(target_os = "macos")]
-pub use darwin::*;
+pub use darwin::CoreTextRasterizer as Rasterizer;
 
 /// Placeholder glyph key that represents a blank glyph
 pub const PLACEHOLDER_GLYPH: KeyType = KeyType::Placeholder;
@@ -62,7 +61,7 @@ pub enum Style {
 impl fmt::Display for Style {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            Style::Specific(ref s) => f.write_str(&s),
+            Style::Specific(ref s) => f.write_str(s),
             Style::Description { slant, weight } => {
                 write!(f, "slant={:?}, weight={:?}", slant, weight)
             },
@@ -104,7 +103,7 @@ impl FontKey {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct GlyphKey {
-    pub id: KeyType,
+    pub character: char,
     pub font_key: FontKey,
     pub size: Size,
 }
@@ -184,34 +183,36 @@ impl From<f32> for Size {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct RasterizedGlyph {
-    pub character: KeyType,
+    pub character: char,
     pub width: i32,
     pub height: i32,
     pub top: i32,
     pub left: i32,
+    pub advance: (i32, i32),
     pub buffer: BitmapBuffer,
 }
 
 #[derive(Clone, Debug)]
 pub enum BitmapBuffer {
     /// RGB alphamask.
-    RGB(Vec<u8>),
+    Rgb(Vec<u8>),
 
     /// RGBA pixels with premultiplied alpha.
-    RGBA(Vec<u8>),
+    Rgba(Vec<u8>),
 }
 
 impl Default for RasterizedGlyph {
     fn default() -> RasterizedGlyph {
         RasterizedGlyph {
-            character: KeyType::Placeholder,
+            character: ' ',
             width: 0,
             height: 0,
             top: 0,
             left: 0,
-            buffer: BitmapBuffer::RGB(Vec::new()),
+            advance: (0, 0),
+            buffer: BitmapBuffer::Rgb(Vec::new()),
         }
     }
 }
@@ -224,20 +225,7 @@ impl<'a> fmt::Debug for BufDebugger<'a> {
     }
 }
 
-impl fmt::Debug for RasterizedGlyph {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("RasterizedGlyph")
-            .field("character", &self.character)
-            .field("width", &self.width)
-            .field("height", &self.height)
-            .field("top", &self.top)
-            .field("left", &self.left)
-            .field("buffer", &self.buffer)
-            .finish()
-    }
-}
-
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub struct Metrics {
     pub average_advance: f64,
     pub line_height: f64,
@@ -289,7 +277,7 @@ impl Display for Error {
 
 pub trait Rasterize {
     /// Create a new Rasterizer.
-    fn new(device_pixel_ratio: f32, use_thin_strokes: bool, ligatures: bool) -> Result<Self, Error>
+    fn new(device_pixel_ratio: f32, ligatures: bool) -> Result<Self, Error>
     where
         Self: Sized;
 
@@ -304,6 +292,9 @@ pub trait Rasterize {
 
     /// Update the Rasterizer's DPI factor.
     fn update_dpr(&mut self, device_pixel_ratio: f32);
+
+    /// Kerning between two characters.
+    fn kerning(&mut self, left: GlyphKey, right: GlyphKey) -> (f32, f32);
 }
 
 #[derive(Clone, Debug)]

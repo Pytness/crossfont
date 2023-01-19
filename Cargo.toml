@@ -1,6 +1,6 @@
 [package]
 name = "crossfont"
-version = "0.2.0"
+version = "0.5.1"
 description = "Cross platform native font loading and rasterization"
 authors = ["Christian Duerr <contact@christianduerr.com>", "Joe Wilm <joe@jwilm.com>"]
 repository = "https://github.com/alacritty/crossfont.git"
@@ -9,7 +9,8 @@ license = "Apache-2.0"
 readme = "README.md"
 categories = ["gui", "os"]
 keywords = ["font"]
-edition = "2018"
+edition = "2021"
+rust-version = "1.56.0"
 
 [dependencies]
 libc = "0.2"
@@ -30,6 +31,8 @@ core-foundation = "0.9"
 core-text = "19"
 core-graphics = "0.22"
 core-foundation-sys = "0.8"
+objc = "0.2.7"
+once_cell = "1.12"
 
 [target.'cfg(windows)'.dependencies]
 dwrote = { version = "0.11" }

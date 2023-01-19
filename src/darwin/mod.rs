@@ -1,25 +1,28 @@
 //! Font rendering based on CoreText.
 
-#![allow(improper_ctypes)]
 use std::collections::HashMap;
+use std::ffi::CStr;
 use std::iter;
 use std::path::PathBuf;
 use std::ptr;
 
+use cocoa::base::{id, nil};
+use cocoa::foundation::{NSString, NSUserDefaults};
+
 use core_foundation::array::{CFArray, CFIndex};
 use core_foundation::attributed_string::CFAttributedStringCreate;
-use core_foundation::base::{kCFAllocatorDefault, TCFType};
 use core_foundation::dictionary::CFDictionary;
-use core_foundation::number::CFNumber;
+use core_foundation::base::{kCFAllocatorDefault, CFType, ItemRef, TCFType};
+use core_foundation::number::{CFNumber, CFNumberRef};
 use core_foundation::string::CFString;
 use core_graphics::base::kCGImageAlphaPremultipliedFirst;
 use core_graphics::color_space::CGColorSpace;
 use core_graphics::context::CGContext;
-use core_graphics::font::{CGFont, CGGlyph};
+use core_graphics::font::CGGlyph;
 use core_graphics::geometry::{CGPoint, CGRect, CGSize};
 use core_text::font::{
     cascade_list_for_languages as ct_cascade_list_for_languages,
-    new_from_descriptor as ct_new_from_descriptor, CTFont,
+    new_from_descriptor as ct_new_from_descriptor, new_from_name, CTFont,
 };
 use core_text::font_collection::create_for_family;
 use core_text::font_collection::get_family_names as ct_get_family_names;
@@ -34,8 +37,15 @@ use core_text::string_attributes::*;
 
 use cocoa::base::{id, nil, NO};
 use cocoa::foundation::{NSOperatingSystemVersion, NSProcessInfo, NSString, NSUserDefaults};
+use core_text::font_descriptor::{
+    self, kCTFontColorGlyphsTrait, kCTFontDefaultOrientation, kCTFontEnabledAttribute,
+    CTFontDescriptor, SymbolicTraitAccessors,
+};
 
 use log::{trace, warn};
+use objc::rc::autoreleasepool;
+use objc::{class, msg_send, sel, sel_impl};
+use once_cell::sync::Lazy;
 
 pub mod byte_order;
 use byte_order::kCGBitmapByteOrder32Host;
@@ -53,11 +63,8 @@ const MISSING_GLYPH_INDEX: u32 = 0;
 ///
 /// The descriptor provides data about a font and supports creating a font.
 #[derive(Debug)]
-pub struct Descriptor {
-    family_name: String,
-    font_name: String,
+struct Descriptor {
     style_name: String,
-    display_name: String,
     font_path: PathBuf,
 
     ct_descriptor: CTFontDescriptor,
@@ -66,72 +73,50 @@ pub struct Descriptor {
 impl Descriptor {
     fn new(desc: CTFontDescriptor) -> Descriptor {
         Descriptor {
-            family_name: desc.family_name(),
-            font_name: desc.font_name(),
             style_name: desc.style_name(),
-            display_name: desc.display_name(),
             font_path: desc.font_path().unwrap_or_else(PathBuf::new),
             ct_descriptor: desc,
         }
     }
 
     /// Create a Font from this descriptor.
-    pub fn to_font(&self, size: f64, load_fallbacks: bool) -> Font {
+    fn to_font(&self, size: f64, load_fallbacks: bool) -> Font {
         let ct_font = ct_new_from_descriptor(&self.ct_descriptor, size);
-        let cg_font = ct_font.copy_to_CGFont();
 
         let fallbacks = if load_fallbacks {
-            descriptors_for_family("Menlo")
+            // TODO fixme, hardcoded en for english.
+            let mut fallbacks = cascade_list_for_languages(&ct_font, &["en".to_owned()])
                 .into_iter()
-                .find(|d| d.font_name == "Menlo-Regular")
-                .map(|descriptor| {
-                    let menlo = ct_new_from_descriptor(&descriptor.ct_descriptor, size);
+                .filter(|desc| !desc.font_path.as_os_str().is_empty())
+                .map(|desc| desc.to_font(size, false))
+                .collect::<Vec<_>>();
 
-                    // TODO fixme, hardcoded en for english.
-                    let mut fallbacks = cascade_list_for_languages(&menlo, &["en".to_owned()])
-                        .into_iter()
-                        .filter(|desc| !desc.font_path.as_os_str().is_empty())
-                        .map(|desc| desc.to_font(size, false))
-                        .collect::<Vec<_>>();
+            // TODO, we can't use apple's proposed
+            // .Apple Symbol Fallback (filtered out below),
+            // but not having these makes us not able to render
+            // many chars. We add the symbols back in.
+            // Investigate if we can actually use the .-prefixed
+            // fallbacks somehow.
+            if let Ok(apple_symbols) = new_from_name("Apple Symbols", size) {
+                fallbacks.push(Font { ct_font: apple_symbols, fallbacks: Vec::new() })
+            };
 
-                    // TODO, we can't use apple's proposed
-                    // .Apple Symbol Fallback (filtered out below),
-                    // but not having these makes us not able to render
-                    // many chars. We add the symbols back in.
-                    // Investigate if we can actually use the .-prefixed
-                    // fallbacks somehow.
-                    if let Some(descriptor) =
-                        descriptors_for_family("Apple Symbols").into_iter().next()
-                    {
-                        fallbacks.push(descriptor.to_font(size, false))
-                    };
-
-                    // Include Menlo in the fallback list as well.
-                    fallbacks.insert(0, Font {
-                        cg_font: menlo.copy_to_CGFont(),
-                        ct_font: menlo,
-                        fallbacks: Vec::new(),
-                    });
-
-                    fallbacks
-                })
-                .unwrap_or_else(Vec::new)
+            fallbacks
         } else {
             Vec::new()
         };
 
-        Font { ct_font, cg_font, fallbacks }
+        Font { ct_font, fallbacks }
     }
 }
 
-/// Rasterizer, the main type exported by this package.
+/// CoreTextRasterizer, the main type exported by this package.
 ///
 /// Given a fontdesc, can rasterize fonts.
-pub struct Rasterizer {
+pub struct CoreTextRasterizer {
     fonts: HashMap<FontKey, Font>,
     keys: HashMap<(FontDesc, Size), FontKey>,
     device_pixel_ratio: f32,
-    use_thin_strokes: bool,
 }
 
 impl RasterizeExt for Rasterizer {
@@ -170,18 +155,9 @@ impl RasterizeExt for Rasterizer {
     }
 }
 
-impl Rasterize for Rasterizer {
-    fn new(
-        device_pixel_ratio: f32,
-        use_thin_strokes: bool,
-        _ligatures: bool,
-    ) -> Result<Rasterizer, Error> {
-        Ok(Rasterizer {
-            fonts: HashMap::new(),
-            keys: HashMap::new(),
-            device_pixel_ratio,
-            use_thin_strokes,
-        })
+impl crate::Rasterize for CoreTextRasterizer {
+    fn new(device_pixel_ratio: f32) -> Result<CoreTextRasterizer, Error> {
+        Ok(CoreTextRasterizer { fonts: HashMap::new(), keys: HashMap::new(), device_pixel_ratio })
     }
 
     /// Get metrics for font specified by FontKey.
@@ -209,14 +185,21 @@ impl Rasterize for Rasterizer {
         // Get loaded font.
         let font = self.fonts.get(&glyph.font_key).ok_or(Error::UnknownFontKey)?;
 
-        // If glyph is index type.
-        if let KeyType::GlyphIndex(glyph_index) = glyph.id {
-            let glyph = font.get_glyph(glyph_index, self.use_thin_strokes);
-            if glyph_index == MISSING_GLYPH_INDEX {
-                return Err(Error::MissingGlyph(glyph));
-            } else {
-                return Ok(glyph);
-            }
+        // Find a font where the given character is present.
+        let (font, glyph_index) = iter::once(font)
+            .chain(font.fallbacks.iter())
+            .find_map(|font| match font.glyph_index(glyph.character) {
+                MISSING_GLYPH_INDEX => None,
+                glyph_index => Some((font, glyph_index)),
+            })
+            .unwrap_or((font, MISSING_GLYPH_INDEX));
+
+        let glyph = font.get_glyph(glyph.character, glyph_index);
+
+        if glyph_index == MISSING_GLYPH_INDEX {
+            Err(Error::MissingGlyph(glyph))
+        } else {
+            Ok(glyph)
         }
 
         if let KeyType::Char(character) = glyph.id {
@@ -249,12 +232,16 @@ impl Rasterize for Rasterizer {
         })
     }
 
+    fn kerning(&mut self, _left: GlyphKey, _right: GlyphKey) -> (f32, f32) {
+        (0., 0.)
+    }
+
     fn update_dpr(&mut self, device_pixel_ratio: f32) {
         self.device_pixel_ratio = device_pixel_ratio;
     }
 }
 
-impl Rasterizer {
+impl CoreTextRasterizer {
     fn get_specific_face(
         &mut self,
         desc: &FontDesc,
@@ -307,63 +294,11 @@ impl Rasterizer {
     }
 }
 
-/// Specifies the intended rendering orientation of the font for obtaining glyph metrics.
-#[derive(Debug)]
-pub enum FontOrientation {
-    Default = kCTFontDefaultOrientation as isize,
-    Horizontal = kCTFontHorizontalOrientation as isize,
-    Vertical = kCTFontVerticalOrientation as isize,
-}
-
-impl Default for FontOrientation {
-    fn default() -> FontOrientation {
-        FontOrientation::Default
-    }
-}
-
-/// Set subpixel anti-aliasing on macOS.
-///
-/// Sub-pixel anti-aliasing has been disabled since macOS Mojave by default. This function allows
-/// overriding the global `CGFontRenderingFontSmoothingDisabled` setting on a per-application basis
-/// to re-enable it.
-///
-/// This is a no-op on systems running High Sierra or earlier (< 10.14.0).
-pub fn set_font_smoothing(enable: bool) {
-    let min_macos_version = NSOperatingSystemVersion::new(10, 14, 0);
-    unsafe {
-        // Check that we're running at least Mojave (10.14.0+).
-        if !NSProcessInfo::processInfo(nil).isOperatingSystemAtLeastVersion(min_macos_version) {
-            return;
-        }
-
-        let key = NSString::alloc(nil).init_str("CGFontRenderingFontSmoothingDisabled");
-        if enable {
-            id::standardUserDefaults().setBool_forKey_(NO, key);
-        } else {
-            id::standardUserDefaults().removeObject_forKey_(key);
-        }
-    }
-}
-
-/// List all family names.
-pub fn get_family_names() -> Vec<String> {
-    // CFArray of CFStringRef.
-    let names = ct_get_family_names();
-    let mut owned_names = Vec::new();
-
-    for name in names.iter() {
-        owned_names.push(name.to_string());
-    }
-
-    owned_names
-}
-
 /// Return fallback descriptors for font/language list.
 fn cascade_list_for_languages(ct_font: &CTFont, languages: &[String]) -> Vec<Descriptor> {
     // Convert language type &Vec<String> -> CFArray.
     let langarr: CFArray<CFString> = {
-        let tmp: Vec<CFString> =
-            languages.iter().map(|language| CFString::new(&language)).collect();
+        let tmp: Vec<CFString> = languages.iter().map(|language| CFString::new(language)).collect();
         CFArray::from_CFTypes(&tmp)
     };
 
@@ -371,11 +306,29 @@ fn cascade_list_for_languages(ct_font: &CTFont, languages: &[String]) -> Vec<Des
     let list = ct_cascade_list_for_languages(ct_font, &langarr);
 
     // Convert CFArray to Vec<Descriptor>.
-    list.into_iter().map(|fontdesc| Descriptor::new(fontdesc.clone())).collect()
+    list.into_iter().filter(is_enabled).map(|fontdesc| Descriptor::new(fontdesc.clone())).collect()
+}
+
+/// Check if a font is enabled.
+fn is_enabled(fontdesc: &ItemRef<'_, CTFontDescriptor>) -> bool {
+    unsafe {
+        let descriptor = fontdesc.as_concrete_TypeRef();
+        let attr_val =
+            font_descriptor::CTFontDescriptorCopyAttribute(descriptor, kCTFontEnabledAttribute);
+
+        if attr_val.is_null() {
+            return false;
+        }
+
+        let attr_val = CFType::wrap_under_create_rule(attr_val);
+        let attr_val = CFNumber::wrap_under_get_rule(attr_val.as_CFTypeRef() as CFNumberRef);
+
+        attr_val.to_i32().unwrap_or(0) != 0
+    }
 }
 
 /// Get descriptors for family name.
-pub fn descriptors_for_family(family: &str) -> Vec<Descriptor> {
+fn descriptors_for_family(family: &str) -> Vec<Descriptor> {
     let mut out = Vec::new();
 
     trace!("Family: {}", family);
@@ -396,28 +349,62 @@ pub fn descriptors_for_family(family: &str) -> Vec<Descriptor> {
     out
 }
 
+// The AppleFontSmoothing user default controls font smoothing on macOS, which increases the stroke
+// width. By default it is unset, and the system behaves as though it is set to 2, which means a
+// medium level of font smoothing. The valid values are integers from 0 to 3. Any other type,
+// including a boolean, does not change the behavior. The Core Graphics call we use only supports
+// enabling or disabling font smoothing, so we will treat an integer 0 as disabling it, and any
+// other integer, or a missing value (the default), or a value of any other type, as leaving it
+// enabled.
+static FONT_SMOOTHING_ENABLED: Lazy<bool> = Lazy::new(|| {
+    autoreleasepool(|| unsafe {
+        let key = NSString::alloc(nil).init_str("AppleFontSmoothing");
+        let value: id = msg_send![id::standardUserDefaults(), objectForKey: key];
+
+        if !msg_send![value, isKindOfClass: class!(NSNumber)] {
+            return true;
+        }
+
+        let num_type: id = msg_send![value, objCType];
+        if num_type == nil {
+            return true;
+        }
+
+        // NSNumber's objCType method returns one of these strings depending on the size:
+        // q = quad (long long), l = long, i = int, s = short.
+        // This is done to reject booleans, which are NSNumbers with an objCType of "c", but macOS
+        // does not treat them the same as an integer 0 or 1 for this setting, it just ignores it.
+        let int_specifiers: [&[u8]; 4] = [b"q", b"l", b"i", b"s"];
+        if !int_specifiers.contains(&CStr::from_ptr(num_type as *const i8).to_bytes()) {
+            return true;
+        }
+
+        let smoothing: id = msg_send![value, integerValue];
+        smoothing as i64 != 0
+    })
+});
+
 /// A font.
 #[derive(Clone)]
-pub struct Font {
+struct Font {
     ct_font: CTFont,
-    cg_font: CGFont,
     fallbacks: Vec<Font>,
 }
 
 unsafe impl Send for Font {}
 
 impl Font {
-    pub fn metrics(&self) -> Metrics {
+    fn metrics(&self) -> Metrics {
         let average_advance = self.glyph_advance('0');
 
-        let ascent = self.ct_font.ascent() as f64;
-        let descent = self.ct_font.descent() as f64;
-        let leading = self.ct_font.leading() as f64;
-        let line_height = (ascent + descent + leading + 0.5).floor();
+        let ascent = self.ct_font.ascent().round() as f64;
+        let descent = self.ct_font.descent().round() as f64;
+        let leading = self.ct_font.leading().round() as f64;
+        let line_height = ascent + descent + leading;
 
         // Strikeout and underline metrics.
         // CoreText doesn't provide strikeout so we provide our own.
-        let underline_position = (self.ct_font.underline_position() - descent) as f32;
+        let underline_position = self.ct_font.underline_position() as f32;
         let underline_thickness = self.ct_font.underline_thickness() as f32;
         let strikeout_position = (line_height / 2. - descent) as f32;
         let strikeout_thickness = underline_thickness;
@@ -433,15 +420,15 @@ impl Font {
         }
     }
 
-    pub fn is_bold(&self) -> bool {
+    fn is_bold(&self) -> bool {
         self.ct_font.symbolic_traits().is_bold()
     }
 
-    pub fn is_italic(&self) -> bool {
+    fn is_italic(&self) -> bool {
         self.ct_font.symbolic_traits().is_italic()
     }
 
-    pub fn is_colored(&self) -> bool {
+    fn is_colored(&self) -> bool {
         (self.ct_font.symbolic_traits() & kCTFontColorGlyphsTrait) != 0
     }
 
@@ -452,7 +439,7 @@ impl Font {
 
         unsafe {
             self.ct_font.get_advances_for_glyphs(
-                FontOrientation::Default as _,
+                kCTFontDefaultOrientation,
                 &indices[0],
                 ptr::null_mut(),
                 1,
@@ -460,10 +447,10 @@ impl Font {
         }
     }
 
-    pub fn get_glyph(&self, glyph_index: u32, use_thin_strokes: bool) -> RasterizedGlyph {
+    fn get_glyph(&self, character: char, glyph_index: u32) -> RasterizedGlyph {
         let bounds = self
             .ct_font
-            .get_bounding_rects_for_glyphs(CTFontOrientation::default(), &[glyph_index as CGGlyph]);
+            .get_bounding_rects_for_glyphs(kCTFontDefaultOrientation, &[glyph_index as CGGlyph]);
 
         let rasterized_left = bounds.origin.x.floor() as i32;
         let rasterized_width =
@@ -479,7 +466,8 @@ impl Font {
                 height: 0,
                 top: 0,
                 left: 0,
-                buffer: BitmapBuffer::RGB(Vec::new()),
+                advance: (0, 0),
+                buffer: BitmapBuffer::Rgb(Vec::new()),
             };
         }
 
@@ -506,12 +494,8 @@ impl Font {
 
         cg_context.fill_rect(context_rect);
 
-        if use_thin_strokes {
-            cg_context.set_font_smoothing_style(16);
-        }
-
         cg_context.set_allows_font_smoothing(true);
-        cg_context.set_should_smooth_fonts(true);
+        cg_context.set_should_smooth_fonts(*FONT_SMOOTHING_ENABLED);
         cg_context.set_allows_font_subpixel_quantization(true);
         cg_context.set_should_subpixel_quantize_fonts(true);
         cg_context.set_allows_font_subpixel_positioning(true);
@@ -533,9 +517,9 @@ impl Font {
         let rasterized_pixels = cg_context.data().to_vec();
 
         let buffer = if is_colored {
-            BitmapBuffer::RGBA(byte_order::extract_rgba(&rasterized_pixels))
+            BitmapBuffer::Rgba(byte_order::extract_rgba(&rasterized_pixels))
         } else {
-            BitmapBuffer::RGB(byte_order::extract_rgb(&rasterized_pixels))
+            BitmapBuffer::Rgb(byte_order::extract_rgb(&rasterized_pixels))
         };
 
         RasterizedGlyph {
@@ -544,6 +528,7 @@ impl Font {
             top: (bounds.size.height + bounds.origin.y).ceil() as i32,
             width: rasterized_width as i32,
             height: rasterized_height as i32,
+            advance: (0, 0),
             buffer,
         }
     }
@@ -583,13 +568,6 @@ mod tests {
     use super::BitmapBuffer;
 
     #[test]
-    fn get_family_names() {
-        let names = super::get_family_names();
-        assert!(names.contains(&String::from("Menlo")));
-        assert!(names.contains(&String::from("Monaco")));
-    }
-
-    #[test]
     fn get_descriptors_and_build_font() {
         let list = super::descriptors_for_family("Menlo");
         assert!(!list.is_empty());
@@ -602,10 +580,10 @@ mod tests {
             // Get a glyph.
             for character in &['a', 'b', 'c', 'd'] {
                 let glyph_index = font.glyph_index(*character);
-                let glyph = font.get_glyph(glyph_index, false);
+                let glyph = font.get_glyph(*character, glyph_index);
 
                 let buffer = match &glyph.buffer {
-                    BitmapBuffer::RGB(buffer) | BitmapBuffer::RGBA(buffer) => buffer,
+                    BitmapBuffer::Rgb(buffer) | BitmapBuffer::Rgba(buffer) => buffer,
                 };
 
                 // Debug the glyph.. sigh.

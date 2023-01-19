@@ -88,7 +88,7 @@ impl DirectWriteRasterizer {
         let bounds =
             glyph_analysis.get_alpha_texture_bounds(dwrote::DWRITE_TEXTURE_CLEARTYPE_3x1)?;
 
-        let buffer = BitmapBuffer::RGB(
+        let buffer = BitmapBuffer::Rgb(
             glyph_analysis.create_alpha_texture(dwrote::DWRITE_TEXTURE_CLEARTYPE_3x1, bounds)?,
         );
 
@@ -98,6 +98,7 @@ impl DirectWriteRasterizer {
             height: (bounds.bottom - bounds.top) as i32,
             top: -bounds.top,
             left: bounds.left,
+            advance: (0, 0),
             buffer,
         })
     }
@@ -151,7 +152,6 @@ impl DirectWriteRasterizer {
 impl crate::Rasterize for DirectWriteRasterizer {
     fn new(
         device_pixel_ratio: f32,
-        _: bool,
         _ligatures: bool,
     ) -> Result<DirectWriteRasterizer, Error> {
         let analyzer = unsafe {
@@ -269,30 +269,15 @@ impl crate::Rasterize for DirectWriteRasterizer {
 
         let loaded_fallback_font;
         let mut font = loaded_font;
-        let glyph_index = match glyph.id {
-            KeyType::Char(character) => {
-                let mut index = self.get_char_index(&loaded_font.face, character);
-                if index == MISSING_GLYPH_INDEX {
-                    if let Some(fallback_font) = self.get_fallback_font(&loaded_font, character) {
-                        loaded_fallback_font = Font::from(fallback_font);
-                        font = &loaded_fallback_font;
-                        index = self.get_char_index(&loaded_fallback_font.face, character);
-                    }
-                }
-                index
-            },
-            KeyType::GlyphIndex(index) => index as u16,
-            KeyType::Placeholder => {
-                return Ok(RasterizedGlyph {
-                    character: KeyType::Placeholder,
-                    width: 0,
-                    height: 0,
-                    top: 0,
-                    left: 0,
-                    buffer: BitmapBuffer::RGB(Vec::new()),
-                });
-            },
-        };
+        let mut glyph_index = self.get_glyph_index(&loaded_font.face, glyph.character);
+
+        if glyph_index == MISSING_GLYPH_INDEX {
+            if let Some(fallback_font) = self.get_fallback_font(loaded_font, glyph.character) {
+                loaded_fallback_font = Font::from(fallback_font);
+                glyph_index = self.get_glyph_index(&loaded_fallback_font.face, glyph.character);
+                font = &loaded_fallback_font;
+            }
+        }
 
         let rasterized_glyph = self.rasterize_glyph(&font.face, glyph.size, glyph_index)?;
 
@@ -301,6 +286,10 @@ impl crate::Rasterize for DirectWriteRasterizer {
         } else {
             Ok(rasterized_glyph)
         }
+    }
+
+    fn kerning(&mut self, left: GlyphKey, right: GlyphKey) -> (f32, f32) {
+        (0., 0.)
     }
 
     fn update_dpr(&mut self, device_pixel_ratio: f32) {

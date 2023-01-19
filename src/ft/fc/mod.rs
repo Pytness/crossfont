@@ -5,6 +5,7 @@ use foreign_types::{ForeignType, ForeignTypeRef};
 
 use fontconfig::fontconfig as ffi;
 
+use ffi::FcInitBringUptoDate;
 use ffi::FcResultNoMatch;
 use ffi::{FcFontList, FcFontMatch, FcFontSort};
 use ffi::{FcMatchFont, FcMatchPattern, FcMatchScan};
@@ -27,7 +28,7 @@ pub mod char_set;
 pub use char_set::{CharSet, CharSetRef};
 
 pub mod pattern;
-pub use pattern::{FTFaceLocation, Pattern, PatternHash, PatternRef};
+pub use pattern::{FtFaceLocation, Pattern, PatternHash, PatternRef};
 
 /// Find the font closest matching the provided pattern.
 ///
@@ -44,6 +45,13 @@ pub fn font_match(config: &ConfigRef, pattern: &PatternRef) -> Option<Pattern> {
         } else {
             Some(Pattern::from_ptr(ptr))
         }
+    }
+}
+
+/// Reloads the Fontconfig configuration files.
+pub fn update_config() {
+    unsafe {
+        let _ = FcInitBringUptoDate();
     }
 }
 
@@ -302,7 +310,7 @@ mod tests {
         let fonts = super::font_sort(config, &pattern).expect("sort font monospace");
 
         for font in fonts.into_iter().take(10) {
-            let font = pattern.render_prepare(&config, &font);
+            let font = pattern.render_prepare(config, font);
             print!("index={:?}; ", font.index());
             print!("family={:?}; ", font.family());
             print!("style={:?}; ", font.style());
@@ -326,7 +334,7 @@ mod tests {
         let fonts = super::font_sort(config, &pattern).expect("font_sort");
 
         for font in fonts.into_iter().take(10) {
-            let font = pattern.render_prepare(&config, &font);
+            let font = pattern.render_prepare(config, font);
             print!("index={:?}; ", font.index());
             print!("family={:?}; ", font.family());
             print!("style={:?}; ", font.style());
